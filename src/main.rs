@@ -1,7 +1,7 @@
 mod proto;
 mod snapshot;
 
-use std::{borrow::BorrowMut, cell::RefCell, rc::Rc};
+use std::{borrow::BorrowMut, cell::RefCell, rc::Rc, time::Duration};
 
 use futures::{future, StreamExt as _};
 use tokio::{task, task::spawn_local};
@@ -152,23 +152,70 @@ async fn main() {
 
 struct Track {
     is_muted: RefCell<bool>,
-    direction: Direction,
+    snapshot: Rc<snapshot::Track>,
+    peer_snapshot: Rc<snapshot::Peer>,
 }
 
-use std::time::Duration;
-
 impl Track {
-    fn new(snap: &Rc<snapshot::Track>) -> Self {
-        println!("Track [dir = {:?}] created.", snap.direction);
-        Self {
+    fn new(
+        snapshot: Rc<snapshot::Track>,
+        peer_snapshot: Rc<snapshot::Peer>,
+    ) -> Rc<Self> {
+        println!("Track [dir = {:?}] created.", snapshot.direction);
+        let this = Rc::new(Self {
             is_muted: RefCell::new(false),
-            direction: snap.direction,
-        }
+            snapshot,
+            peer_snapshot,
+        });
+
+        Rc::clone(&this).spawn_on_track_muted();
+
+        this
+    }
+
+    /// Spawns listener for the mute/unmute of the [`Track`].
+    fn spawn_on_track_muted(self: Rc<Self>) {
+        // skip initial is_muted value, because we don't need it in the real app
+        let mut on_track_muted = self.snapshot.is_muted.subscribe().skip(1);
+        spawn_local({
+            async move {
+                while let Some(is_muted) = on_track_muted.next().await {
+                    match self.snapshot.direction {
+                        proto::Direction::Send => {
+                            // wait until all receivers will be updated, before
+                            // updating this track
+                            self.peer_snapshot
+                                .receivers_update_in_progress
+                                .when_eq(0)
+                                .await;
+                        }
+                        _ => (),
+                    }
+
+                    self.update_is_muted(is_muted).await;
+
+                    // decrease track update schedules counter, because
+                    // update_is_muted future was resolved
+                    match self.snapshot.direction {
+                        proto::Direction::Send => {
+                            self.peer_snapshot
+                                .senders_update_in_progress
+                                .mutate(|mut c| *c -= 1);
+                        }
+                        proto::Direction::Recv => {
+                            self.peer_snapshot
+                                .receivers_update_in_progress
+                                .mutate(|mut c| *c -= 1);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn update_is_muted(&self, is_muted: bool) {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        println!("Track [dir = {:?}] updated.", self.direction);
+        println!("Track [dir = {:?}] updated.", self.snapshot.direction);
         *self.is_muted.borrow_mut() = is_muted;
     }
 }
@@ -179,15 +226,152 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(snap: &Rc<snapshot::Peer>) -> Self {
-        Self {
+    fn new(snapshot: Rc<snapshot::Peer>) -> Rc<Self> {
+        let this = Rc::new(Self {
             tracks: RefCell::default(),
-            snapshot: snap.clone(),
-        }
+            snapshot,
+        });
+
+        Rc::clone(&this).spawn_on_track_created();
+        Rc::clone(&this).spawn_on_ice_restart();
+        Rc::clone(&this).spawn_on_negotiation_role();
+
+        this
+    }
+
+    /// Spawns [`Peer::negotiation_role`] listener.
+    ///
+    /// Will start negotiation process on [`Peer::negotiation_role`] update.
+    fn spawn_on_negotiation_role(self: Rc<Self>) {
+        let mut on_negotiation_role = Box::pin(
+            self.snapshot
+                .negotiation_role
+                .subscribe()
+                .filter_map(|q| future::ready(q)),
+        );
+        spawn_local(async move {
+            while let Some(new_role) = on_negotiation_role.next().await {
+                // wait until ice will be restarted
+                self.snapshot.restart_ice.when_eq(false).await;
+                match new_role {
+                    snapshot::NegotiationRole::Offerer => {
+                        // wait until all senders and receivers will be
+                        // created/updated.
+                        future::join(
+                            self.snapshot.senders_update_in_progress.when_eq(0),
+                            self.snapshot
+                                .receivers_update_in_progress
+                                .when_eq(0),
+                        )
+                        .await;
+                        let sdp_offer = self.get_offer().await;
+                        self.snapshot.sdp_offer.set(Some(sdp_offer));
+                        // wait until partner Peer will provided his SDP offer
+                        self.snapshot
+                            .remote_sdp_offer
+                            .subscribe()
+                            .skip(1)
+                            .filter_map(|o| future::ready(o))
+                            .next()
+                            .await;
+                        // reset negotiation_role to None
+                        self.snapshot.negotiation_finished();
+                    }
+                    snapshot::NegotiationRole::Answerer(remote_offer) => {
+                        // wait until all receivers will be created/updated
+                        self.snapshot
+                            .receivers_update_in_progress
+                            .when_eq(0)
+                            .await;
+
+                        self.set_remote_offer(remote_offer.clone()).await;
+                        self.snapshot
+                            .remote_sdp_offer
+                            .set(Some(remote_offer.clone()));
+
+                        // wait until all senders will be created/updated
+                        self.snapshot
+                            .senders_update_in_progress
+                            .when_eq(0)
+                            .await;
+
+                        let sdp_offer = self.get_offer().await;
+                        self.snapshot.sdp_offer.set(Some(sdp_offer));
+
+                        // reset negotiation_role to None
+                        self.snapshot.negotiation_finished();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Spawns task which will create new [`Track`]s.
+    fn spawn_track_creation_task(self: Rc<Self>, track: Rc<snapshot::Track>) {
+        spawn_local(async move {
+            match track.direction {
+                Direction::Send => {
+                    if let Some(NegotiationRole::Answerer(_)) =
+                        self.snapshot.negotiation_role.borrow().clone()
+                    {
+                        // wait until all receivers will be created/updated
+                        self.snapshot
+                            .remote_sdp_offer
+                            .subscribe()
+                            .skip(1)
+                            .filter(|s| future::ready(s.is_some()))
+                            .next()
+                            .await;
+                    }
+                }
+                _ => (),
+            }
+
+            let track = Track::new(track, Rc::clone(&self.snapshot));
+
+            // decrease scheduled changes counter
+            match track.snapshot.direction {
+                Direction::Send => {
+                    self.snapshot
+                        .senders_update_in_progress
+                        .mutate(|mut c| *c -= 1);
+                }
+                Direction::Recv => {
+                    self.snapshot
+                        .receivers_update_in_progress
+                        .mutate(|mut c| *c -= 1);
+                }
+            }
+        });
     }
 
     fn spawn_on_track_created(self: Rc<Self>) {
+        let mut on_track_created = self.snapshot.tracks.borrow().on_push();
+        spawn_local(async move {
+            while let Some(track) = on_track_created.next().await {
+                Rc::clone(&self).spawn_track_creation_task(track);
+            }
+        });
+    }
 
+    /// Spawns listener for the ICE restart requests.
+    fn spawn_on_ice_restart(self: Rc<Self>) {
+        let mut on_ice_restart =
+            Box::pin(self.snapshot.restart_ice.subscribe().filter_map(
+                |is_ice_restart| async move {
+                    if is_ice_restart {
+                        Some(())
+                    } else {
+                        None
+                    }
+                },
+            ));
+        spawn_local(async move {
+            while let Some(_) = on_ice_restart.next().await {
+                self.restart_ice().await;
+                self.snapshot.restart_ice.set(false);
+            }
+        });
     }
 
     async fn get_offer(&self) -> String {
@@ -211,178 +395,6 @@ struct Room {
 }
 
 impl Room {
-    async fn create_peer(&self, peer_snap: Rc<snapshot::Peer>) {
-        let peer = Rc::new(Peer::new(&peer_snap));
-        spawn_local({
-            let peer = Rc::clone(&peer);
-            let peer_snap = Rc::clone(&peer_snap);
-            let mut on_track_created = peer_snap.tracks.borrow().on_push();
-            async move {
-                while let Some(track) = on_track_created.next().await {
-                    spawn_local({
-                        let peer = Rc::clone(&peer);
-                        let peer_snap = Rc::clone(&peer_snap);
-                        async move {
-                            match track.direction {
-                                Direction::Send => {
-                                    if let Some(NegotiationRole::Answerer(_)) =
-                                        peer_snap
-                                            .negotiation_role
-                                            .borrow()
-                                            .clone()
-                                    {
-                                        peer_snap
-                                            .remote_sdp_offer
-                                            .subscribe()
-                                            .skip(1)
-                                            .filter(|s| {
-                                                future::ready(s.is_some())
-                                            }).next().await;
-                                    }
-                                }
-                                _ => (),
-                            }
-                            Self::create_track(
-                                peer,
-                                peer_snap.clone(),
-                                track.clone(),
-                            )
-                            .await;
-                            match track.direction {
-                                Direction::Send => {
-                                    peer_snap
-                                        .senders_update_in_progress
-                                        .mutate(|mut c| *c -= 1);
-                                }
-                                Direction::Recv => {
-                                    peer_snap
-                                        .receivers_update_in_progress
-                                        .mutate(|mut c| *c -= 1);
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        });
-        spawn_local({
-            let peer = Rc::clone(&peer);
-            let peer_snap = Rc::clone(&peer_snap);
-            let mut on_negotiation_role = Box::pin(
-                peer_snap
-                    .negotiation_role
-                    .subscribe()
-                    .filter_map(|q| future::ready(q)),
-            );
-
-            async move {
-                while let Some(new_role) = on_negotiation_role.next().await {
-                    peer_snap.restart_ice.when_eq(false).await;
-                    match new_role {
-                        snapshot::NegotiationRole::Offerer => {
-                            future::join(
-                                peer_snap.senders_update_in_progress.when_eq(0),
-                                peer_snap
-                                    .receivers_update_in_progress
-                                    .when_eq(0),
-                            )
-                            .await;
-                            let sdp_offer = peer.get_offer().await;
-                            peer_snap.sdp_offer.set(Some(sdp_offer));
-                            peer_snap
-                                .remote_sdp_offer
-                                .subscribe()
-                                .skip(1)
-                                .filter_map(|o| future::ready(o))
-                                .next()
-                                .await;
-                            peer_snap.negotiation_finished();
-                        }
-                        snapshot::NegotiationRole::Answerer(remote_offer) => {
-                            peer_snap
-                                .receivers_update_in_progress
-                                .when_eq(0)
-                                .await;
-                            peer.set_remote_offer(remote_offer.clone()).await;
-                            peer_snap
-                                .remote_sdp_offer
-                                .set(Some(remote_offer.clone()));
-                            peer_snap
-                                .senders_update_in_progress
-                                .when_eq(0)
-                                .await;
-                            let sdp_offer = peer.get_offer().await;
-                            peer_snap.sdp_offer.set(Some(sdp_offer));
-                            peer_snap.negotiation_finished();
-                        }
-                    }
-                }
-            }
-        });
-        spawn_local({
-            let peer = Rc::clone(&peer);
-            let snap = Rc::clone(&peer_snap);
-            let mut on_ice_restart =
-                Box::pin(snap.restart_ice.subscribe().filter_map(
-                    |is_ice_restart| async move {
-                        if is_ice_restart {
-                            Some(())
-                        } else {
-                            None
-                        }
-                    },
-                ));
-            async move {
-                while let Some(_) = on_ice_restart.next().await {
-                    peer.restart_ice().await;
-                    snap.restart_ice.set(false);
-                }
-            }
-        });
-        self.peers.borrow_mut().push(peer);
-    }
-
-    async fn create_track(
-        peer: Rc<Peer>,
-        peer_snap: Rc<snapshot::Peer>,
-        track_snap: Rc<snapshot::Track>,
-    ) {
-        let track = Rc::new(Track::new(&track_snap));
-        spawn_local({
-            let track = Rc::clone(&track);
-            let mut on_track_muted = track_snap.is_muted.subscribe().skip(1);
-            async move {
-                while let Some(is_muted) = on_track_muted.next().await {
-                    match track_snap.direction {
-                        proto::Direction::Send => {
-                            peer_snap
-                                .receivers_update_in_progress
-                                .when_eq(0)
-                                .await;
-                        }
-                        _ => (),
-                    }
-
-                    track.update_is_muted(is_muted).await;
-                    match track_snap.direction {
-                        proto::Direction::Send => {
-                            peer_snap
-                                .senders_update_in_progress
-                                .mutate(|mut c| *c -= 1);
-                        }
-                        proto::Direction::Recv => {
-                            peer_snap
-                                .receivers_update_in_progress
-                                .mutate(|mut c| *c -= 1);
-                        }
-                    }
-                }
-            }
-        });
-    }
-}
-
-impl Room {
     pub fn new() -> Rc<Self> {
         let snapshot = Rc::new(snapshot::Room::new());
         let this = Rc::new(Self {
@@ -395,7 +407,7 @@ impl Room {
             let this = Rc::clone(&this);
             async move {
                 if let Some(peer) = on_peer_created.next().await {
-                    this.create_peer(peer).await;
+                    this.peers.borrow_mut().push(Peer::new(peer));
                 }
             }
         });
