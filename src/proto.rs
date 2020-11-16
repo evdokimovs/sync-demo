@@ -1,15 +1,11 @@
-pub enum Event {
-    PeerCreated { tracks: Vec<Track> },
-
-    TrackUpdate { changes: Vec<TrackChange> },
-}
-
 pub struct Track {
+    pub id: u32,
     pub is_muted: bool,
     pub direction: Direction,
 }
 
 pub struct TrackPatch {
+    pub id: u32,
     pub is_muted: Option<bool>,
 }
 
