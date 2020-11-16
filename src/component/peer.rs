@@ -1,66 +1,48 @@
-use super::proto;
-use crate::{proto::Direction, MediaStreamTrack, RtcPeerConnection};
+use std::{cell::RefCell, rc::Rc};
+
 use futures::{future, StreamExt as _};
 use medea_reactive::{ObservableCell, ObservableVec, ProgressableObservable};
-use std::{cell::RefCell, rc::Rc};
 use tokio::task::spawn_local;
 
-pub struct Room {
-    pub peers: RefCell<ObservableVec<Rc<Peer>>>,
-}
-
-impl Room {
-    pub fn new() -> Self {
-        Self {
-            peers: RefCell::new(ObservableVec::new()),
-        }
-    }
-
-    pub fn spawn_tasks(&self) {
-        self.spawn_on_peer_created();
-    }
-
-    pub fn spawn_on_peer_created(&self) {
-        let mut on_peer_created = self.peers.borrow().on_push();
-        spawn_local(async move {
-            while let Some(peer) = on_peer_created.next().await {
-                let rtc_peer = RtcPeerConnection::new();
-                Rc::clone(&peer).spawn_tasks(rtc_peer);
-            }
-        });
-    }
-}
+use crate::{
+    component, proto,
+    sys::{MediaStreamTrack, RtcPeerConnection},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NegotiationState {
+enum NegotiationState {
     HaveRemote,
     HaveLocal,
     Stable,
 }
 
 pub struct Peer {
-    pub senders: RefCell<ObservableVec<Rc<Sender>>>,
-    pub receivers: RefCell<ObservableVec<Rc<Receiver>>>,
+    pub senders: RefCell<ObservableVec<Rc<component::Sender>>>,
+    pub receivers: RefCell<ObservableVec<Rc<component::Receiver>>>,
     pub restart_ice: RefCell<ProgressableObservable<bool>>,
-    pub negotiation_role: ObservableCell<Option<NegotiationRole>>,
-    pub negotiation_state: ObservableCell<NegotiationState>,
+    pub negotiation_role: ObservableCell<Option<proto::NegotiationRole>>,
     pub remote_sdp_offer: ObservableCell<Option<String>>,
+    negotiation_state: ObservableCell<NegotiationState>,
 }
 
 impl Peer {
     pub fn new(
         tracks: Vec<proto::Track>,
-        negotiation_role: NegotiationRole,
+        negotiation_role: proto::NegotiationRole,
     ) -> Rc<Self> {
         let mut senders = Vec::new();
         let mut receivers = Vec::new();
         for track in tracks {
             match track.direction {
-                Direction::Send => {
-                    senders.push(Sender::new(track.id, track.is_muted));
+                proto::Direction::Send => {
+                    senders
+                        .push(component::Sender::new(track.id, track.is_muted));
                 }
-                Direction::Recv => {
-                    receivers.push(Receiver::new(track.id, track.is_muted));
+                proto::Direction::Recv => {
+                    receivers.push(component::Receiver::new(
+                        track.id,
+                        track.is_muted,
+                    ));
                 }
             }
         }
@@ -109,7 +91,7 @@ impl Peer {
         let mut on_sender_added = self.senders.borrow().on_push();
         spawn_local(async move {
             while let Some(sender) = on_sender_added.next().await {
-                if let Some(NegotiationRole::Answerer(_)) =
+                if let Some(proto::NegotiationRole::Answerer(_)) =
                     self.negotiation_role.borrow().clone()
                 {
                     if let Err(_) = self
@@ -161,7 +143,7 @@ impl Peer {
                     wait_for_ice_restart.when_all_processed()
                 };
                 match negotiation_needed {
-                    Some(NegotiationRole::Offerer) => {
+                    Some(proto::NegotiationRole::Offerer) => {
                         future::join(
                             self.receivers.borrow().when_push_completed(),
                             self.senders.borrow().when_push_completed(),
@@ -180,7 +162,7 @@ impl Peer {
                         }
                         self.negotiation_role.set(None);
                     }
-                    Some(NegotiationRole::Answerer(remote_offer)) => {
+                    Some(proto::NegotiationRole::Answerer(remote_offer)) => {
                         self.receivers.borrow().when_push_completed().await;
                         self.remote_sdp_offer.set(Some(remote_offer));
 
@@ -196,64 +178,4 @@ impl Peer {
             }
         });
     }
-}
-
-pub struct Sender {
-    pub id: u32,
-    pub is_muted: RefCell<ProgressableObservable<bool>>,
-}
-
-impl Sender {
-    pub fn new(id: u32, is_muted: bool) -> Rc<Self> {
-        Rc::new(Self {
-            id,
-            is_muted: RefCell::new(ProgressableObservable::new(is_muted)),
-        })
-    }
-
-    pub fn spawn_tasks(self: Rc<Self>, track: MediaStreamTrack) {
-        Rc::clone(&self).spawn_on_muted(track);
-    }
-
-    fn spawn_on_muted(self: Rc<Self>, track: MediaStreamTrack) {
-        let mut on_muted = self.is_muted.borrow().subscribe();
-        spawn_local(async move {
-            while let Some(is_muted) = on_muted.next().await {
-                track.set_enabled(!*is_muted).await;
-            }
-        });
-    }
-}
-
-pub struct Receiver {
-    pub id: u32,
-    pub is_muted: RefCell<ProgressableObservable<bool>>,
-}
-
-impl Receiver {
-    pub fn new(id: u32, is_muted: bool) -> Rc<Self> {
-        Rc::new(Self {
-            id,
-            is_muted: RefCell::new(ProgressableObservable::new(is_muted)),
-        })
-    }
-
-    pub fn spawn_tasks(self: Rc<Self>, track: MediaStreamTrack) {
-        Rc::clone(&self).spawn_on_muted(track);
-    }
-
-    fn spawn_on_muted(self: Rc<Self>, track: MediaStreamTrack) {
-        let mut on_muted = self.is_muted.borrow().subscribe();
-        spawn_local(async move {
-            while let Some(is_muted) = on_muted.next().await {
-                track.set_enabled(!*is_muted).await;
-            }
-        });
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum NegotiationRole {
-    Offerer,
-    Answerer(String),
 }

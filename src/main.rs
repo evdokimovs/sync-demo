@@ -1,11 +1,12 @@
+mod component;
 mod proto;
-mod snapshot;
+mod sys;
 
 use std::{rc::Rc, time::Duration};
 
 use tokio::{task, task::spawn_local, time::sleep};
 
-use crate::{proto::Direction, snapshot::NegotiationRole};
+use crate::proto::{Direction, NegotiationRole};
 
 #[tokio::main]
 async fn main() {
@@ -30,7 +31,7 @@ async fn main() {
             spawn_local({
                 let room = Rc::clone(&room);
                 async move {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    sleep(Duration::from_secs(2)).await;
                     room.sdp_answer_made("aaa".to_string());
                 }
             });
@@ -110,62 +111,13 @@ async fn main() {
         .await;
 }
 
-#[derive(Clone, Debug)]
-pub struct MediaStreamTrack;
-
-impl MediaStreamTrack {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub async fn set_enabled(&self, _: bool) {
-        println!("Set enabled");
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
-#[derive(Clone)]
-pub struct RtcPeerConnection;
-
-impl RtcPeerConnection {
-    pub fn new() -> Self {
-        RtcPeerConnection
-    }
-
-    pub async fn restart_ice(&self) {
-        println!("Ice restart");
-        sleep(Duration::from_millis(500)).await;
-    }
-
-    pub async fn set_remote_offer(&self, _: String) {
-        println!("Set remote offer");
-        sleep(Duration::from_millis(500)).await;
-    }
-
-    pub async fn get_local_offer(&self) -> String {
-        println!("Get local offer");
-        sleep(Duration::from_millis(500)).await;
-
-        "SDP OFFER".to_string()
-    }
-
-    pub async fn add_transceiver(&self) {
-        println!("Add transceiver");
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
-struct EventHandler {
-    snapshot: Rc<snapshot::Room>,
-}
+struct EventHandler(Rc<component::Room>);
 
 impl EventHandler {
     pub fn new() -> Rc<Self> {
-        let snapshot = Rc::new(snapshot::Room::new());
-        snapshot.spawn_tasks();
-        let this = Rc::new(Self {
-            snapshot: Rc::clone(&snapshot),
-        });
+        let room = Rc::new(component::Room::new());
+        room.spawn_tasks();
+        let this = Rc::new(Self(room));
 
         this
     }
@@ -173,12 +125,12 @@ impl EventHandler {
     fn peer_created(
         &self,
         tracks: Vec<proto::Track>,
-        negotiation_role: snapshot::NegotiationRole,
+        negotiation_role: proto::NegotiationRole,
     ) {
-        self.snapshot
+        self.0
             .peers
             .borrow_mut()
-            .push(snapshot::Peer::new(tracks, negotiation_role));
+            .push(component::Peer::new(tracks, negotiation_role));
     }
 
     fn tracks_applied(
@@ -186,7 +138,7 @@ impl EventHandler {
         updates: Vec<proto::TrackChange>,
         negotiation_role: Option<NegotiationRole>,
     ) {
-        let peer = self.snapshot.peers.borrow().iter().next().unwrap().clone();
+        let peer = self.0.peers.borrow().iter().next().unwrap().clone();
         for update in updates {
             match update {
                 proto::TrackChange::IceRestart => {
@@ -214,14 +166,14 @@ impl EventHandler {
                 }
                 proto::TrackChange::Added(track) => match track.direction {
                     Direction::Send => {
-                        peer.senders.borrow_mut().push(snapshot::Sender::new(
+                        peer.senders.borrow_mut().push(component::Sender::new(
                             track.id,
                             track.is_muted,
                         ));
                     }
                     Direction::Recv => {
                         peer.receivers.borrow_mut().push(
-                            snapshot::Receiver::new(track.id, track.is_muted),
+                            component::Receiver::new(track.id, track.is_muted),
                         );
                     }
                 },
@@ -231,14 +183,14 @@ impl EventHandler {
     }
 
     fn sdp_answer_made(&self, sdp_answer: String) {
-        let peer = self.snapshot.peers.borrow().iter().next().unwrap().clone();
+        let peer = self.0.peers.borrow().iter().next().unwrap().clone();
         peer.remote_sdp_offer.set(Some(sdp_answer));
     }
 }
 
 impl EventHandler {
     async fn wait_for_negotiation_finish(&self) {
-        self.snapshot
+        self.0
             .peers
             .borrow()
             .iter()

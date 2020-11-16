@@ -9,6 +9,12 @@ pub struct TrackPatch {
     pub is_muted: Option<bool>,
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum NegotiationRole {
+    Offerer,
+    Answerer(String),
+}
+
 pub enum TrackChange {
     Added(Track),
     Update(TrackPatch),
